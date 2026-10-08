@@ -1,0 +1,7 @@
+﻿expenses.db
+transactions.csv
+dist/
+build/
+__pycache__/
+*.pyc
+data/
