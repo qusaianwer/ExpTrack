@@ -1,6 +1,6 @@
 import customtkinter as ctk
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone
 
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
@@ -14,24 +14,44 @@ ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
 
+# DATABASE (Supabase + local in-memory cache)
 # ==================================================
-# DATABASE
-# ==================================================
+#
+# All data lives in Supabase (same account as the phone app).
+# After login everything is loaded into a small in-memory SQLite
+# cache so the screens below can keep using fast local queries.
+# Every add / edit / delete is written to Supabase first, then
+# mirrored into the cache.
 
 import os
+import sys
 from pathlib import Path
+from tkinter import messagebox
+
+try:
+    from supabase import create_client
+except ImportError:
+    print("Missing package. Run:  pip install supabase")
+    sys.exit(1)
+
+SUPABASE_URL = "https://veeyvdfgftgqzypkghmb.supabase.co"
+SUPABASE_KEY = "sb_publishable_t19_b1VmzdUmAKYHuZiF0Q__x6OxIUz"
 
 APP_DIR = Path(os.getenv("APPDATA", Path.home())) / "ExpTrack"
 APP_DIR.mkdir(parents=True, exist_ok=True)
-DB_PATH = APP_DIR / "expenses.db"
+EMAIL_FILE = APP_DIR / "last_email.txt"
 
-conn = sqlite3.connect(DB_PATH)
+sb = create_client(SUPABASE_URL, SUPABASE_KEY)
+current_user_id = None
+
+# In-memory cache (rebuilt from Supabase on every start)
+conn = sqlite3.connect(":memory:")
 cursor = conn.cursor()
 
-# Create transactions table if it doesn't exist
 cursor.execute("""
-    CREATE TABLE IF NOT EXISTS transactions (
+    CREATE TABLE transactions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
+        uid TEXT,
         type TEXT NOT NULL,
         amount REAL NOT NULL,
         category TEXT,
@@ -40,28 +60,274 @@ cursor.execute("""
     )
 """)
 
-# Make sure the date column exists (for older databases)
-cursor.execute("PRAGMA table_info(transactions)")
-columns = [column[1] for column in cursor.fetchall()]
-
-if "date" not in columns:
-    cursor.execute("ALTER TABLE transactions ADD COLUMN date TEXT")
-    cursor.execute(
-        "UPDATE transactions SET date = ? WHERE date IS NULL",
-        (datetime.now().strftime("%Y-%m-%d %H:%M:%S"),)
-    )
-
-# Make sure budgets table exists
 cursor.execute("""
-    CREATE TABLE IF NOT EXISTS budgets (
+    CREATE TABLE budgets (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
+        uid TEXT,
         category TEXT NOT NULL,
         amount REAL NOT NULL,
         month TEXT NOT NULL
     )
 """)
 
-conn.commit()
+
+def _to_local_str(iso):
+    """Supabase timestamp -> local 'YYYY-MM-DD HH:MM:SS'."""
+    iso = str(iso).replace("Z", "+00:00")
+    dt = datetime.fromisoformat(iso)
+    if dt.tzinfo is not None:
+        dt = dt.astimezone()
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _local_str_to_iso(s):
+    """Local 'YYYY-MM-DD HH:MM:SS' -> ISO with timezone for Supabase."""
+    dt = datetime.strptime(s, "%Y-%m-%d %H:%M:%S").astimezone()
+    return dt.isoformat()
+
+
+def _fail(action, error):
+    messagebox.showerror("ExpTrack", f"Could not {action}.\n\n{error}")
+    raise error
+
+
+def load_cache():
+    """Pull all of the user's data from Supabase into the cache."""
+    cursor.execute("DELETE FROM transactions")
+    cursor.execute("DELETE FROM budgets")
+
+    rows = []
+    start = 0
+    while True:
+        res = (
+            sb.table("transactions")
+            .select("id,type,amount,category,description,occurred_at")
+            .order("occurred_at")
+            .range(start, start + 999)
+            .execute()
+        )
+        rows.extend(res.data)
+        if len(res.data) < 1000:
+            break
+        start += 1000
+
+    for r in rows:
+        cursor.execute(
+            "INSERT INTO transactions (uid,type,amount,category,description,date)"
+            " VALUES (?,?,?,?,?,?)",
+            (
+                r["id"],
+                r["type"],
+                float(r["amount"]),
+                r.get("category") or "",
+                r.get("description") or "",
+                _to_local_str(r["occurred_at"]),
+            ),
+        )
+
+    res = sb.table("budgets").select("id,category,amount,month").execute()
+    for b in res.data:
+        cursor.execute(
+            "INSERT INTO budgets (uid,category,amount,month) VALUES (?,?,?,?)",
+            (b["id"], b["category"], float(b["amount"]), str(b["month"])[:7]),
+        )
+    conn.commit()
+
+
+def _uid_of(table, local_id):
+    cursor.execute(f"SELECT uid FROM {table} WHERE id = ?", (local_id,))
+    row = cursor.fetchone()
+    return row[0] if row else None
+
+
+def db_add_transaction(t_type, amount, category, description, date_str):
+    try:
+        res = sb.table("transactions").insert({
+            "user_id": current_user_id,
+            "type": t_type,
+            "amount": amount,
+            "category": category,
+            "description": description,
+            "occurred_at": _local_str_to_iso(date_str),
+        }).execute()
+    except Exception as e:
+        _fail("save the transaction", e)
+    cursor.execute(
+        "INSERT INTO transactions (uid,type,amount,category,description,date)"
+        " VALUES (?,?,?,?,?,?)",
+        (res.data[0]["id"], t_type, amount, category, description, date_str),
+    )
+    conn.commit()
+
+
+def db_update_transaction(local_id, t_type, amount, category, description):
+    uid = _uid_of("transactions", local_id)
+    try:
+        sb.table("transactions").update({
+            "type": t_type,
+            "amount": amount,
+            "category": category,
+            "description": description,
+        }).eq("id", uid).execute()
+    except Exception as e:
+        _fail("update the transaction", e)
+    cursor.execute(
+        "UPDATE transactions SET type=?, amount=?, category=?, description=?"
+        " WHERE id=?",
+        (t_type, amount, category, description, local_id),
+    )
+    conn.commit()
+
+
+def db_delete_transaction(local_id):
+    uid = _uid_of("transactions", local_id)
+    try:
+        sb.table("transactions").delete().eq("id", uid).execute()
+    except Exception as e:
+        _fail("delete the transaction", e)
+    cursor.execute("DELETE FROM transactions WHERE id = ?", (local_id,))
+    conn.commit()
+
+
+def db_add_budget(category, amount, month):
+    """month is 'YYYY-MM' (stored in Supabase as the 1st of the month)."""
+    try:
+        res = sb.table("budgets").insert({
+            "user_id": current_user_id,
+            "category": category,
+            "amount": amount,
+            "month": month + "-01",
+        }).execute()
+    except Exception as e:
+        _fail("save the budget", e)
+    cursor.execute(
+        "INSERT INTO budgets (uid,category,amount,month) VALUES (?,?,?,?)",
+        (res.data[0]["id"], category, amount, month),
+    )
+    conn.commit()
+
+
+# ==================================================
+# LOGIN WINDOW (same account as the phone app)
+# ==================================================
+
+def run_login():
+    global current_user_id
+
+    login = ctk.CTk()
+    login.title("ExpTrack - Sign in")
+    login.geometry("420x520")
+    login.resizable(False, False)
+
+    state = {"ok": False}
+
+    ctk.CTkLabel(
+        login, text="ExpTrack",
+        font=ctk.CTkFont(size=34, weight="bold"),
+        text_color="#3DDC97"
+    ).pack(pady=(50, 4))
+
+    ctk.CTkLabel(
+        login, text="Sign in with the same account as your phone",
+        font=ctk.CTkFont(size=13)
+    ).pack(pady=(0, 30))
+
+    email_entry = ctk.CTkEntry(
+        login, width=300, height=42, placeholder_text="Email"
+    )
+    email_entry.pack(pady=8)
+
+    password_entry = ctk.CTkEntry(
+        login, width=300, height=42, placeholder_text="Password", show="*"
+    )
+    password_entry.pack(pady=8)
+
+    msg = ctk.CTkLabel(login, text="", text_color="#E74C3C", wraplength=300)
+    msg.pack(pady=8)
+
+    try:
+        saved = EMAIL_FILE.read_text(encoding="utf-8").strip()
+        if saved:
+            email_entry.insert(0, saved)
+    except Exception:
+        pass
+
+    def finish(user):
+        global current_user_id
+        current_user_id = user.id
+        try:
+            EMAIL_FILE.write_text(email_entry.get().strip(), encoding="utf-8")
+        except Exception:
+            pass
+        msg.configure(text="Loading your data...", text_color="#3DDC97")
+        login.update()
+        try:
+            load_cache()
+        except Exception as e:
+            msg.configure(text=f"Could not load data: {e}", text_color="#E74C3C")
+            return
+        state["ok"] = True
+        login.destroy()
+
+    def do_sign_in(event=None):
+        email = email_entry.get().strip()
+        password = password_entry.get()
+        if not email or not password:
+            msg.configure(text="Enter email and password.", text_color="#E74C3C")
+            return
+        msg.configure(text="Signing in...", text_color="#3DDC97")
+        login.update()
+        try:
+            res = sb.auth.sign_in_with_password(
+                {"email": email, "password": password}
+            )
+            finish(res.user)
+        except Exception as e:
+            msg.configure(text=str(e), text_color="#E74C3C")
+
+    def do_sign_up():
+        email = email_entry.get().strip()
+        password = password_entry.get()
+        if not email or len(password) < 6:
+            msg.configure(
+                text="Enter email and a password (6+ characters).",
+                text_color="#E74C3C"
+            )
+            return
+        try:
+            res = sb.auth.sign_up({"email": email, "password": password})
+            if res.session is None:
+                msg.configure(
+                    text="Account created. Confirm your email, then sign in.",
+                    text_color="#3DDC97"
+                )
+            else:
+                finish(res.user)
+        except Exception as e:
+            msg.configure(text=str(e), text_color="#E74C3C")
+
+    ctk.CTkButton(
+        login, text="Sign in", width=300, height=44,
+        fg_color="#3DDC97", hover_color="#2FB57D", text_color="#0F1A17",
+        font=ctk.CTkFont(size=15, weight="bold"),
+        command=do_sign_in
+    ).pack(pady=(10, 8))
+
+    ctk.CTkButton(
+        login, text="Create account", width=300, height=40,
+        fg_color="transparent", border_width=1, border_color="#3DDC97",
+        text_color="#3DDC97", command=do_sign_up
+    ).pack(pady=4)
+
+    password_entry.bind("<Return>", do_sign_in)
+    login.protocol("WM_DELETE_WINDOW", login.destroy)
+    login.mainloop()
+
+    if not state["ok"]:
+        sys.exit(0)
+
+
+run_login()
 
 # ==================================================
 # MAIN WINDOW
@@ -676,22 +942,13 @@ def show_add_transaction(transaction_type):
             "%Y-%m-%d %H:%M:%S"
         )
 
-        cursor.execute(
-            """
-            INSERT INTO transactions
-            (type, amount, category, description, date)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (
-                transaction_type,
-                amount,
-                category,
-                description,
-                current_date
-            )
+        db_add_transaction(
+            transaction_type,
+            amount,
+            category,
+            description,
+            current_date
         )
-
-        conn.commit()
 
         message.configure(
             text=f"{title} added successfully!",
@@ -924,22 +1181,13 @@ def edit_transaction(transaction_id):
 
             return
 
-        cursor.execute("""
-            UPDATE transactions
-            SET type = ?,
-                amount = ?,
-                category = ?,
-                description = ?
-            WHERE id = ?
-        """, (
+        db_update_transaction(
+            transaction_id,
             transaction_type,
             amount,
             category,
-            description,
-            transaction_id
-        ))
-
-        conn.commit()
+            description
+        )
 
         window.destroy()
 
@@ -1003,12 +1251,7 @@ def delete_transaction(transaction_id):
 
     def confirm_delete():
 
-        cursor.execute(
-            "DELETE FROM transactions WHERE id = ?",
-            (transaction_id,)
-        )
-
-        conn.commit()
+        db_delete_transaction(transaction_id)
 
         confirmation.destroy()
 
@@ -1565,20 +1808,7 @@ def add_budget_window():
 
             return
 
-        cursor.execute(
-            """
-            INSERT INTO budgets
-            (category, amount, month)
-            VALUES (?, ?, ?)
-            """,
-            (
-                category,
-                amount,
-                current_month
-            )
-        )
-
-        conn.commit()
+        db_add_budget(category, amount, current_month)
 
         message.configure(
             text="Budget added successfully!",
@@ -2279,10 +2509,19 @@ ctk.CTkFrame(
 # NAVIGATION BUTTONS
 # ==================================================
 
+current_screen = {"fn": None}
+
+
 def create_sidebar_button(
     text,
     command
 ):
+
+    original_command = command
+
+    def command():
+        current_screen["fn"] = original_command
+        original_command()
 
     button = ctk.CTkButton(
         sidebar,
@@ -2371,12 +2610,52 @@ main_frame.pack(
 
 
 # ==================================================
+# REFRESH BUTTON (top-right) - reloads data from Supabase
+# ==================================================
+
+def refresh_data():
+
+    refresh_button.configure(text="Refreshing...", state="disabled")
+    app.update_idletasks()
+
+    try:
+        load_cache()
+    except Exception as e:
+        messagebox.showerror(
+            "ExpTrack",
+            f"Could not refresh.\n\n{e}"
+        )
+    else:
+        (current_screen["fn"] or show_dashboard)()
+    finally:
+        refresh_button.configure(text="⟳  Refresh", state="normal")
+        refresh_button.lift()
+
+
+refresh_button = ctk.CTkButton(
+    app,
+    text="⟳  Refresh",
+    width=110,
+    height=32,
+    corner_radius=8,
+    fg_color="#2FA572",
+    hover_color="#278B60",
+    font=ctk.CTkFont(size=13, weight="bold"),
+    command=refresh_data
+)
+
+refresh_button.place(relx=1.0, x=-20, y=12, anchor="ne")
+refresh_button.lift()
+
+app.bind("<F5>", lambda event: refresh_data())
+
+
+# ==================================================
 # CLOSE APP
 # ==================================================
 
 def close_app():
     try:
-        conn.commit()
         conn.close()
     except Exception:
         pass
@@ -2388,6 +2667,8 @@ def close_app():
 # START
 # ==================================================
 
+current_screen["fn"] = show_dashboard
 show_dashboard()
+refresh_button.lift()
 
 app.mainloop()
